@@ -54,6 +54,15 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
+SERVICE_SCOPES = {
+    "email": SCOPES[0:3],
+    "calendar": [SCOPES[3]],
+    "drive": [SCOPES[4]],
+    "contacts": [SCOPES[5]],
+    "sheets": [SCOPES[6]],
+    "docs": [SCOPES[7]],
+}
+
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
 
 # OAuth redirect for "out of band" manual code copy flow.
@@ -71,7 +80,7 @@ def _normalize_authorized_user_payload(payload: dict) -> dict:
 
 def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text())
     except Exception:
         return {}
 
@@ -220,7 +229,7 @@ def check_auth(quiet: bool = False):
                 json.dumps(
                     _normalize_authorized_user_payload(json.loads(creds.to_json())),
                     indent=2,
-                ), encoding="utf-8"
+                )
             )
             missing_scopes = _missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
             if missing_scopes:
@@ -260,7 +269,7 @@ def store_client_secret(path: str):
         sys.exit(1)
 
     try:
-        data = json.loads(src.read_text(encoding="utf-8"))
+        data = json.loads(src.read_text())
     except json.JSONDecodeError:
         print("ERROR: File is not valid JSON.")
         sys.exit(1)
@@ -270,11 +279,27 @@ def store_client_secret(path: str):
         print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
         sys.exit(1)
 
-    CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2))
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
-def _save_pending_auth(*, state: str, code_verifier: str):
+def scopes_for_services(services: str) -> list[str]:
+    """Return stable, de-duplicated OAuth scopes for a service selection."""
+    names = [name.strip().lower() for name in services.split(",") if name.strip()]
+    if not names or names == ["all"]:
+        return list(SCOPES)
+    unknown = [name for name in names if name not in SERVICE_SCOPES]
+    if unknown:
+        raise ValueError(f"Unknown Google service(s): {', '.join(unknown)}")
+    selected = []
+    for name in names:
+        for scope in SERVICE_SCOPES[name]:
+            if scope not in selected:
+                selected.append(scope)
+    return selected
+
+
+def _save_pending_auth(*, state: str, code_verifier: str, scopes: list[str]):
     """Persist the OAuth session bits needed for a later token exchange."""
     PENDING_AUTH_PATH.write_text(
         json.dumps(
@@ -282,9 +307,10 @@ def _save_pending_auth(*, state: str, code_verifier: str):
                 "state": state,
                 "code_verifier": code_verifier,
                 "redirect_uri": REDIRECT_URI,
+                "scopes": scopes,
             },
             indent=2,
-        ), encoding="utf-8"
+        )
     )
 
 
@@ -295,7 +321,7 @@ def _load_pending_auth() -> dict:
         sys.exit(1)
 
     try:
-        data = json.loads(PENDING_AUTH_PATH.read_text(encoding="utf-8"))
+        data = json.loads(PENDING_AUTH_PATH.read_text())
     except Exception as e:
         print(f"ERROR: Could not read pending OAuth session: {e}")
         print("Run --auth-url again to start a fresh OAuth session.")
@@ -326,18 +352,24 @@ def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
     return params["code"][0], state
 
 
-def get_auth_url():
+def get_auth_url(services: str = "all", output_format: str = "text"):
     """Print the OAuth authorization URL. User visits this in a browser."""
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
         sys.exit(1)
+
+    try:
+        selected_scopes = scopes_for_services(services)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(2)
 
     _ensure_deps()
     from google_auth_oauthlib.flow import Flow
 
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
+        scopes=selected_scopes,
         redirect_uri=REDIRECT_URI,
         autogenerate_code_verifier=True,
     )
@@ -345,9 +377,12 @@ def get_auth_url():
         access_type="offline",
         prompt="consent",
     )
-    _save_pending_auth(state=state, code_verifier=flow.code_verifier)
-    # Print just the URL so the agent can extract it cleanly
-    print(auth_url)
+    _save_pending_auth(state=state, code_verifier=flow.code_verifier, scopes=selected_scopes)
+    (HERMES_HOME / "google_oauth_last_url.txt").write_text(auth_url)
+    if output_format == "json":
+        print(json.dumps({"auth_url": auth_url, "services": services, "scopes": selected_scopes}))
+    else:
+        print(auth_url)
 
 
 def exchange_auth_code(code: str):
@@ -368,7 +403,8 @@ def exchange_auth_code(code: str):
     from urllib.parse import parse_qs, urlparse
 
     # Extract granted scopes from the callback URL if the user pasted the full redirect URL.
-    granted_scopes = list(SCOPES)
+    requested_scopes = pending_auth.get("scopes") or list(SCOPES)
+    granted_scopes = list(requested_scopes)
     if isinstance(raw_callback, str) and raw_callback.startswith("http"):
         params = parse_qs(urlparse(raw_callback).query)
         scope_val = (params.get("scope") or [""])[0].strip()
@@ -410,7 +446,7 @@ def exchange_auth_code(code: str):
         print(f"WARNING: Token missing some Google Workspace scopes: {', '.join(missing_scopes)}")
         print("Some services may not be available.")
 
-    TOKEN_PATH.write_text(json.dumps(token_payload, indent=2), encoding="utf-8")
+    TOKEN_PATH.write_text(json.dumps(token_payload, indent=2))
     PENDING_AUTH_PATH.unlink(missing_ok=True)
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
     print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
@@ -459,6 +495,11 @@ def main():
     group.add_argument("--auth-code", metavar="CODE", help="Exchange auth code for token")
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
+    parser.add_argument(
+        "--services", default="all",
+        help="Comma-separated services: email,calendar,drive,contacts,sheets,docs, or all",
+    )
+    parser.add_argument("--format", choices=["text", "json"], default="text")
     args = parser.parse_args()
 
     if args.check:
@@ -468,7 +509,7 @@ def main():
     elif args.client_secret:
         store_client_secret(args.client_secret)
     elif args.auth_url:
-        get_auth_url()
+        get_auth_url(args.services, args.format)
     elif args.auth_code:
         exchange_auth_code(args.auth_code)
     elif args.revoke:

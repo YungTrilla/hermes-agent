@@ -56,10 +56,8 @@ Before starting OAuth setup, ask the user TWO questions:
 **Question 1: "What Google services do you need? Just email, or also
 Calendar/Drive/Sheets/Docs?"**
 
-- **Email only** → They don't need this skill at all. Use the `himalaya` skill
-  instead — it works with a Gmail App Password (Settings → Security → App
-  Passwords) and takes 2 minutes to set up. No Google Cloud project needed.
-  Load the himalaya skill and follow its setup instructions.
+- **Email only** → Continue with this skill and use `--services email`. This
+  requests Gmail OAuth scopes only; it never uses an API key or app password.
 
 - **Email + Calendar** → Continue with this skill, but use
   `--services email,calendar` during auth so the consent screen only asks for
@@ -183,6 +181,25 @@ $GAPI gmail search "has:attachment filename:pdf newer_than:7d"
 # Read full message (returns JSON with body text)
 $GAPI gmail get MESSAGE_ID
 
+# Draft — creates server-side state but never sends
+$GAPI gmail draft create --to user@example.com --subject "Hello" --body "Message text"
+$GAPI gmail draft create --subject "Recipient not chosen yet" --body "Message text"
+$GAPI gmail draft create --to user@example.com --subject "HTML" --body "<p>Hello</p>" --html
+$GAPI gmail draft list --max 10
+$GAPI gmail draft list --query "to:user@example.com" --max 10
+$GAPI gmail draft get DRAFT_ID
+
+# Update — unspecified fields are preserved; --clear-to explicitly removes To
+$GAPI gmail draft update DRAFT_ID --subject "Updated subject"
+$GAPI gmail draft update DRAFT_ID --to other@example.com --subject "Updated" --body "New text"
+$GAPI gmail draft update DRAFT_ID --clear-to
+
+# Discard — requires the exact draft ID and verifies Gmail returns not found
+$GAPI gmail draft delete DRAFT_ID
+
+# Send an existing draft — requires separate, explicit user approval
+$GAPI gmail draft send DRAFT_ID
+
 # Send
 $GAPI gmail send --to user@example.com --subject "Hello" --body "Message text"
 $GAPI gmail send --to user@example.com --subject "Report" --body "<h1>Q4</h1><p>Details...</p>" --html
@@ -292,6 +309,10 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 
 - **Gmail search**: `[{id, threadId, from, to, subject, date, snippet, labels}]`
 - **Gmail get**: `{id, threadId, from, to, subject, date, labels, body}`
+- **Gmail draft create/update**: `{status: "drafted", draftId, messageId, threadId, to, subject, body, html}`
+- **Gmail draft list/get**: draft objects with `{draftId, messageId, threadId, to, subject, body, html}`
+- **Gmail draft delete**: `{status: "deleted", draftId}` after a verified not-found read-back
+- **Gmail draft send**: `{status: "sent", draftId, messageId, threadId}` after message and draft-state verification
 - **Gmail send/reply**: `{status: "sent", id, threadId}`
 - **Calendar list**: `[{id, summary, start, end, location, description, htmlLink}]`
 - **Calendar create**: `{status: "created", id, summary, htmlLink}`
@@ -310,11 +331,13 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 
 ## Rules
 
-1. **Never send email, create/delete calendar events, delete Drive files, share files, or modify Docs/Sheets without confirming with the user first.** Show what will be done (recipients, file IDs, content, share role) and ask for approval. For `drive delete`, prefer the default trash (reversible) over `--permanent`.
-2. **Check auth before first use** — run `setup.py --check`. If it fails, guide the user through setup.
-3. **Use the Gmail search syntax reference** for complex queries — load it with `skill_view("google-workspace", file_path="references/gmail-search-syntax.md")`.
-4. **Calendar times must include timezone** — always use ISO 8601 with offset (e.g., `2026-03-01T10:00:00-06:00`) or UTC (`Z`).
-5. **Respect rate limits** — avoid rapid-fire sequential API calls. Batch reads when possible.
+1. **Drafting and sending are separate permissions.** Creating, reading, or editing a Gmail draft does not require send approval and must never call a send endpoint. Sending any email—including `gmail draft send`—requires explicit user approval after showing or restating the exact recipient, subject, and body. A request to “draft” is never permission to send.
+2. **Discard exact drafts only.** Deleting/discarding requires the exact `draftId`, followed by a read-back that confirms Gmail returns not found. If the user says “Cancel it,” use the draft ID created in the current task; do not delete by subject or recipient. Keep task draft IDs in current-session state, never durable memory.
+3. **Confirm other external mutations.** Never create/delete calendar events, delete Drive files, share files, or modify Docs/Sheets without confirming first. For `drive delete`, prefer the default trash (reversible) over `--permanent`.
+4. **Check auth before first use** — run `setup.py --check`. If it fails, guide the user through setup.
+5. **Use the Gmail search syntax reference** for complex queries — load it with `skill_view("google-workspace", file_path="references/gmail-search-syntax.md")`.
+6. **Calendar times must include timezone** — always use ISO 8601 with offset (e.g., `2026-03-01T10:00:00-06:00`) or UTC (`Z`).
+7. **Respect rate limits** — avoid rapid-fire sequential API calls. Batch reads when possible.
 
 ## Troubleshooting
 

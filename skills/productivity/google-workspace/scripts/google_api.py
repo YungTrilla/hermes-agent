@@ -8,6 +8,12 @@ libraries if `gws` is not installed.
 Usage:
   python google_api.py gmail search "is:unread" [--max 10]
   python google_api.py gmail get MESSAGE_ID
+  python google_api.py gmail draft create --to user@example.com --subject "Hi" --body "Hello"
+  python google_api.py gmail draft list [--query "to:user@example.com"] [--max 10]
+  python google_api.py gmail draft get DRAFT_ID
+  python google_api.py gmail draft update DRAFT_ID [--to ADDRESS] [--subject TEXT] [--body TEXT]
+  python google_api.py gmail draft delete DRAFT_ID
+  python google_api.py gmail draft send DRAFT_ID
   python google_api.py gmail send --to user@example.com --subject "Hi" --body "Hello"
   python google_api.py gmail reply MESSAGE_ID --body "Thanks"
   python google_api.py calendar list [--from DATE] [--to DATE] [--calendar primary]
@@ -54,6 +60,10 @@ SCOPES = [
 ]
 
 
+class AuthenticationError(RuntimeError):
+    """Google OAuth credentials are missing or invalid."""
+
+
 def _normalize_authorized_user_payload(payload: dict) -> dict:
     normalized = dict(payload)
     if not normalized.get("type"):
@@ -63,14 +73,14 @@ def _normalize_authorized_user_payload(payload: dict) -> dict:
 
 def _ensure_authenticated():
     if not TOKEN_PATH.exists():
-        print("Not authenticated. Run the setup script first:", file=sys.stderr)
-        print(f"  python {Path(__file__).parent / 'setup.py'}", file=sys.stderr)
-        sys.exit(1)
+        raise AuthenticationError(
+            f"Not authenticated. Run: python {Path(__file__).parent / 'setup.py'} --check"
+        )
 
 
 def _stored_token_scopes() -> list[str]:
     try:
-        data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+        data = json.loads(TOKEN_PATH.read_text())
     except Exception:
         return list(SCOPES)
     scopes = data.get("scopes")
@@ -92,7 +102,10 @@ def _gws_env() -> dict[str, str]:
     return env
 
 
-def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None = None):
+def _run_gws(
+    parts: list[str], *, params: dict | None = None, body: dict | None = None,
+    allow_not_found: bool = False,
+):
     binary = _gws_binary()
     if not binary:
         raise RuntimeError("gws not installed")
@@ -113,6 +126,8 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
     )
     if result.returncode != 0:
         err = result.stderr.strip() or result.stdout.strip() or "Unknown gws error"
+        if allow_not_found and ("404" in err or "not found" in err.lower()):
+            return None
         print(err, file=sys.stderr)
         sys.exit(result.returncode or 1)
 
@@ -154,6 +169,68 @@ def _extract_message_body(msg: dict) -> str:
     return body
 
 
+class VerificationError(RuntimeError):
+    """A server-side read-back did not confirm a Gmail mutation."""
+
+
+class UserInputError(ValueError):
+    """The requested operation is unsafe or incomplete."""
+
+
+def _is_not_found(exc: Exception) -> bool:
+    return getattr(getattr(exc, "resp", None), "status", None) == 404 or "404" in str(exc)
+
+
+def _build_raw_message(*, to: str | None, subject: str, body: str, html: bool) -> str:
+    message = MIMEText(body, "html" if html else "plain")
+    if to:
+        message["To"] = to
+    message["Subject"] = subject
+    return base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+
+def _draft_output(draft: dict, *, status: str | None = None) -> dict:
+    message = draft.get("message", {})
+    headers = _headers_dict(message)
+    result = {
+        "draftId": draft.get("id", ""),
+        "messageId": message.get("id", ""),
+        "threadId": message.get("threadId", ""),
+        "to": headers.get("to", ""),
+        "subject": headers.get("subject", ""),
+        "body": _extract_message_body(message),
+        "html": message.get("payload", {}).get("mimeType") == "text/html",
+    }
+    if status:
+        result = {"status": status, **result}
+    return result
+
+
+def _get_draft(backend: str, service, draft_id: str, *, allow_not_found: bool = False):
+    if backend == "gws":
+        return _run_gws(
+            ["gmail", "users", "drafts", "get"],
+            params={"userId": "me", "id": draft_id, "format": "full"},
+            allow_not_found=allow_not_found,
+        )
+    try:
+        return service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    except Exception as exc:
+        if allow_not_found and _is_not_found(exc):
+            return None
+        raise
+
+
+def _verify_draft_fields(actual: dict, expected: dict) -> None:
+    mismatches = {
+        key: {"expected": value, "actual": actual.get(key)}
+        for key, value in expected.items()
+        if actual.get(key) != value
+    }
+    if mismatches:
+        raise VerificationError(f"Gmail draft read-back mismatch: {json.dumps(mismatches, ensure_ascii=False)}")
+
+
 def _extract_doc_text(doc: dict) -> str:
     text_parts = []
     for element in doc.get("body", {}).get("content", []):
@@ -192,7 +269,7 @@ def get_credentials():
             json.dumps(
                 _normalize_authorized_user_payload(json.loads(creds.to_json())),
                 indent=2,
-            ), encoding="utf-8"
+            )
         )
     if not creds.valid:
         print("Token is invalid. Re-run setup.", file=sys.stderr)
@@ -201,9 +278,10 @@ def get_credentials():
 
 
 def build_service(api, version):
+    credentials = get_credentials()
     from googleapiclient.discovery import build
 
-    return build(api, version, credentials=get_credentials())
+    return build(api, version, credentials=credentials)
 
 
 # =========================================================================
@@ -312,6 +390,133 @@ def gmail_get(args):
         "body": _extract_message_body(msg),
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def gmail_draft_create(args):
+    backend = "gws" if _gws_binary() else "python"
+    service = None if backend == "gws" else build_service("gmail", "v1")
+    raw = _build_raw_message(to=args.to, subject=args.subject, body=args.body, html=args.html)
+    request_body = {"message": {"raw": raw}}
+    if backend == "gws":
+        created = _run_gws(
+            ["gmail", "users", "drafts", "create"],
+            params={"userId": "me"}, body=request_body,
+        )
+    else:
+        created = service.users().drafts().create(userId="me", body=request_body).execute()
+    draft_id = created.get("id", "")
+    if not draft_id:
+        raise VerificationError("Gmail did not return a draft ID after creation")
+    verified = _get_draft(backend, service, draft_id)
+    output = _draft_output(verified, status="drafted")
+    _verify_draft_fields(output, {
+        "to": args.to or "", "subject": args.subject, "body": args.body, "html": args.html,
+    })
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+def gmail_draft_list(args):
+    backend = "gws" if _gws_binary() else "python"
+    service = None if backend == "gws" else build_service("gmail", "v1")
+    params = {"userId": "me", "maxResults": args.max}
+    if args.query:
+        params["q"] = args.query
+    if backend == "gws":
+        result = _run_gws(["gmail", "users", "drafts", "list"], params=params)
+    else:
+        result = service.users().drafts().list(**params).execute()
+    output = []
+    for item in result.get("drafts", []):
+        output.append(_draft_output(_get_draft(backend, service, item["id"])))
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+def gmail_draft_get(args):
+    backend = "gws" if _gws_binary() else "python"
+    service = None if backend == "gws" else build_service("gmail", "v1")
+    draft = _get_draft(backend, service, args.draft_id)
+    print(json.dumps(_draft_output(draft), indent=2, ensure_ascii=False))
+
+
+def gmail_draft_update(args):
+    if args.to is None and args.subject is None and args.body is None and not args.clear_to and not args.html:
+        raise UserInputError("Draft update requires at least one changed field")
+    backend = "gws" if _gws_binary() else "python"
+    service = None if backend == "gws" else build_service("gmail", "v1")
+    current = _draft_output(_get_draft(backend, service, args.draft_id))
+    to = "" if args.clear_to else (args.to if args.to is not None else current["to"])
+    subject = args.subject if args.subject is not None else current["subject"]
+    body_text = args.body if args.body is not None else current["body"]
+    html = True if args.html else current["html"]
+    message = {"raw": _build_raw_message(to=to, subject=subject, body=body_text, html=html)}
+    if current["threadId"]:
+        message["threadId"] = current["threadId"]
+    request_body = {"message": message}
+    if backend == "gws":
+        _run_gws(
+            ["gmail", "users", "drafts", "update"],
+            params={"userId": "me", "id": args.draft_id}, body=request_body,
+        )
+    else:
+        service.users().drafts().update(
+            userId="me", id=args.draft_id, body=request_body,
+        ).execute()
+    output = _draft_output(_get_draft(backend, service, args.draft_id), status="drafted")
+    expected = {"threadId": current["threadId"]}
+    if args.to is not None or args.clear_to:
+        expected["to"] = to
+    if args.subject is not None:
+        expected["subject"] = subject
+    if args.body is not None:
+        expected["body"] = body_text
+    if args.html:
+        expected["html"] = True
+    _verify_draft_fields(output, expected)
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+def gmail_draft_delete(args):
+    backend = "gws" if _gws_binary() else "python"
+    service = None if backend == "gws" else build_service("gmail", "v1")
+    if backend == "gws":
+        _run_gws(
+            ["gmail", "users", "drafts", "delete"],
+            params={"userId": "me", "id": args.draft_id},
+        )
+    else:
+        service.users().drafts().delete(userId="me", id=args.draft_id).execute()
+    if _get_draft(backend, service, args.draft_id, allow_not_found=True) is not None:
+        raise VerificationError(f"Draft {args.draft_id} still exists after deletion")
+    print(json.dumps({"status": "deleted", "draftId": args.draft_id}, indent=2))
+
+
+def gmail_draft_send(args):
+    backend = "gws" if _gws_binary() else "python"
+    service = None if backend == "gws" else build_service("gmail", "v1")
+    if backend == "gws":
+        sent = _run_gws(
+            ["gmail", "users", "drafts", "send"],
+            params={"userId": "me"}, body={"id": args.draft_id},
+        )
+        message = _run_gws(
+            ["gmail", "users", "messages", "get"],
+            params={"userId": "me", "id": sent["id"], "format": "metadata"},
+        )
+    else:
+        sent = service.users().drafts().send(
+            userId="me", body={"id": args.draft_id},
+        ).execute()
+        message = service.users().messages().get(
+            userId="me", id=sent["id"], format="metadata",
+        ).execute()
+    if message.get("id") != sent.get("id"):
+        raise VerificationError("Sent Gmail message could not be read back")
+    if _get_draft(backend, service, args.draft_id, allow_not_found=True) is not None:
+        raise VerificationError(f"Draft {args.draft_id} still exists after sending")
+    print(json.dumps({
+        "status": "sent", "draftId": args.draft_id,
+        "messageId": sent["id"], "threadId": sent.get("threadId", ""),
+    }, indent=2))
 
 
 
@@ -1068,6 +1273,43 @@ def main():
     p.add_argument("message_id")
     p.set_defaults(func=gmail_get)
 
+    draft = gmail_sub.add_parser("draft", help="Create, inspect, update, discard, or send Gmail drafts")
+    draft_sub = draft.add_subparsers(dest="draft_action", required=True)
+
+    p = draft_sub.add_parser("create", help="Create and verify a draft without sending")
+    p.add_argument("--to", default=None, help="Recipient (optional)")
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body", required=True)
+    p.add_argument("--html", action="store_true", help="Store body as HTML")
+    p.set_defaults(func=gmail_draft_create)
+
+    p = draft_sub.add_parser("list", help="List drafts and read their current fields")
+    p.add_argument("--query", default="", help="Gmail draft search query")
+    p.add_argument("--max", type=int, default=10)
+    p.set_defaults(func=gmail_draft_list)
+
+    p = draft_sub.add_parser("get", help="Read one exact draft")
+    p.add_argument("draft_id")
+    p.set_defaults(func=gmail_draft_get)
+
+    p = draft_sub.add_parser("update", help="Update supplied fields and preserve all others")
+    p.add_argument("draft_id")
+    to_group = p.add_mutually_exclusive_group()
+    to_group.add_argument("--to", default=None)
+    to_group.add_argument("--clear-to", action="store_true", help="Explicitly remove the recipient")
+    p.add_argument("--subject", default=None)
+    p.add_argument("--body", default=None)
+    p.add_argument("--html", action="store_true", help="Store the resulting body as HTML")
+    p.set_defaults(func=gmail_draft_update)
+
+    p = draft_sub.add_parser("delete", help="Discard one exact draft and verify it is gone")
+    p.add_argument("draft_id")
+    p.set_defaults(func=gmail_draft_delete)
+
+    p = draft_sub.add_parser("send", help="Send one exact draft (agent approval required)")
+    p.add_argument("draft_id")
+    p.set_defaults(func=gmail_draft_send)
+
     p = gmail_sub.add_parser("send")
     p.add_argument("--to", required=True)
     p.add_argument("--subject", required=True)
@@ -1218,7 +1460,17 @@ def main():
     p.set_defaults(func=docs_append)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except (VerificationError, UserInputError, AuthenticationError) as exc:
+        if isinstance(exc, VerificationError):
+            error_type = "verification_failed"
+        elif isinstance(exc, AuthenticationError):
+            error_type = "not_authenticated"
+        else:
+            error_type = "invalid_request"
+        print(json.dumps({"status": "error", "error": error_type, "message": str(exc)}), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
