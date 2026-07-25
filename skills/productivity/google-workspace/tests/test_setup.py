@@ -2,6 +2,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,43 @@ def test_email_only_scopes_are_oauth_scopes_with_no_api_key():
         "https://www.googleapis.com/auth/gmail.modify",
     ]
     assert all("api_key" not in scope and "key=" not in scope for scope in scopes)
+
+
+def test_email_only_token_is_not_reported_as_partial():
+    setup = load_setup()
+    email_scopes = setup.scopes_for_services("email")
+    payload = {"scopes": email_scopes, "hermes_requested_scopes": email_scopes}
+    assert setup._missing_scopes_from_payload(payload) == []
+
+
+def test_live_check_uses_scope_neutral_token_introspection(monkeypatch):
+    setup = load_setup()
+    email_scopes = setup.scopes_for_services("email")
+
+    class FakeCredentials:
+        token = "secret-token-not-for-output"
+
+        @classmethod
+        def from_authorized_user_file(cls, path):
+            return cls()
+
+    modules = {
+        "google": types.ModuleType("google"),
+        "google.oauth2": types.ModuleType("google.oauth2"),
+        "google.oauth2.credentials": types.ModuleType("google.oauth2.credentials"),
+    }
+    setattr(modules["google.oauth2.credentials"], "Credentials", FakeCredentials)
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(setup, "check_auth", lambda quiet=True: True)
+    monkeypatch.setattr(
+        setup,
+        "_load_token_payload",
+        lambda path: {"scopes": email_scopes, "hermes_requested_scopes": email_scopes},
+    )
+    monkeypatch.setattr(setup, "_live_token_scopes", lambda token: email_scopes)
+
+    assert setup.check_auth_live() is True
 
 
 def test_service_selection_rejects_unknown_names():

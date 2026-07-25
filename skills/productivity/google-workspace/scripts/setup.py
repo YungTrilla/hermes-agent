@@ -90,7 +90,8 @@ def _missing_scopes_from_payload(payload: dict) -> list[str]:
     if not raw:
         return []
     granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
+    required = payload.get("hermes_requested_scopes") or SCOPES
+    return sorted(scope for scope in required if scope not in granted)
 
 
 def _format_missing_scopes(missing_scopes: list[str]) -> str:
@@ -165,18 +166,39 @@ def _ensure_deps():
             sys.exit(1)
 
 
+def _live_token_scopes(access_token: str) -> list[str]:
+    """Validate an access token without assuming any particular service scope."""
+    import urllib.parse
+    import urllib.request
+
+    body = urllib.parse.urlencode({"access_token": access_token}).encode()
+    request = urllib.request.Request(
+        "https://oauth2.googleapis.com/tokeninfo",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read())
+    raw = payload.get("scope", "")
+    return raw.split() if isinstance(raw, str) else list(raw)
+
+
 def check_auth_live():
-    """Check auth with a real API call to detect disabled_client/account issues."""
+    """Check auth live without assuming Calendar or another selected service."""
     # quiet=True suppresses the "AUTHENTICATED" print from check_auth so the
     # final status line reflects the live-call outcome (OK or FAILED).
     if not check_auth(quiet=True):
         return False
     try:
-        from googleapiclient.discovery import build
         from google.oauth2.credentials import Credentials
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
-        service = build("calendar", "v3", credentials=creds)
-        service.calendarList().list(maxResults=1).execute()
+        live_scopes = set(_live_token_scopes(creds.token))
+        payload = _load_token_payload(TOKEN_PATH)
+        required = set(payload.get("hermes_requested_scopes") or payload.get("scopes") or [])
+        missing = sorted(required - live_scopes)
+        if missing:
+            print(f"LIVE_CHECK_FAILED: Token is missing selected scopes: {', '.join(missing)}")
+            return False
         print("LIVE_CHECK_OK: Real API call succeeded.")
         return True
     except Exception as e:
@@ -225,12 +247,10 @@ def check_auth(quiet: bool = False):
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            TOKEN_PATH.write_text(
-                json.dumps(
-                    _normalize_authorized_user_payload(json.loads(creds.to_json())),
-                    indent=2,
-                )
-            )
+            refreshed_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))
+            if payload.get("hermes_requested_scopes"):
+                refreshed_payload["hermes_requested_scopes"] = payload["hermes_requested_scopes"]
+            TOKEN_PATH.write_text(json.dumps(refreshed_payload, indent=2))
             missing_scopes = _missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
             if missing_scopes:
                 print(f"AUTHENTICATED (partial): Token refreshed but missing {len(missing_scopes)} scopes:")
@@ -430,6 +450,7 @@ def exchange_auth_code(code: str):
 
     creds = flow.credentials
     token_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))
+    token_payload["hermes_requested_scopes"] = requested_scopes
 
     # Store only the scopes actually granted by the user, not what was requested.
     # creds.to_json() writes the requested scopes, which causes refresh to fail

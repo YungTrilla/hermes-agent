@@ -7,6 +7,7 @@ import subprocess
 import sys
 import types
 from email import message_from_bytes
+from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -40,6 +41,7 @@ def payload_from_raw(raw, message_id, thread_id=""):
     return {
         "id": message_id,
         "threadId": thread_id,
+        "raw": raw,
         "labelIds": ["DRAFT"],
         "payload": {
             "mimeType": msg.get_content_type(),
@@ -202,6 +204,33 @@ def test_update_one_field_preserves_recipient_body_and_thread():
     assert all(name != "drafts.send" for name, _ in service.calls)
 
 
+def test_update_subject_preserves_cc_custom_headers_and_attachments():
+    service = FakeService()
+    message = EmailMessage()
+    message["To"] = "a@example.com"
+    message["Cc"] = "copy@example.com"
+    message["Subject"] = "Old"
+    message["X-Custom"] = "keep-me"
+    message.set_content("Original")
+    message.add_attachment(
+        b"attachment bytes", maintype="application", subtype="octet-stream", filename="test.bin"
+    )
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    service.state["d1"] = {"id": "d1", "message": payload_from_raw(raw, "m1", "thread-1")}
+
+    run_python(ga.gmail_draft_update, service, args(draft_id="d1", subject="New"))
+
+    update = next(v for n, v in service.calls if n == "drafts.update")
+    updated = message_from_bytes(base64.urlsafe_b64decode(update["body"]["message"]["raw"]))
+    assert updated["Subject"] == "New"
+    assert updated["Cc"] == "copy@example.com"
+    assert updated["X-Custom"] == "keep-me"
+    attachments = [part for part in updated.walk() if part.get_content_disposition() == "attachment"]
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "test.bin"
+    assert attachments[0].get_payload(decode=True) == b"attachment bytes"
+
+
 def test_update_all_fields_and_explicit_clear_recipient():
     service = FakeService()
     seed(service)
@@ -209,6 +238,43 @@ def test_update_all_fields_and_explicit_clear_recipient():
     assert (result["to"], result["subject"], result["body"]) == ("b@example.com", "New", "Changed")
     result = run_python(ga.gmail_draft_update, service, args(draft_id="d1", clear_to=True))
     assert result["to"] == ""
+
+
+def test_get_decodes_base64url_mime_body():
+    service = FakeService()
+    seed(service)
+    result = run_python(ga.gmail_draft_get, service, args(draft_id="d1"))
+    assert result["body"] == "Original"
+    assert result["to"] == "a@example.com"
+
+
+def test_get_decodes_nested_multipart_body_and_detects_selected_type():
+    plain = base64.urlsafe_b64encode(b"Nested plain body").decode()
+    html = base64.urlsafe_b64encode(b"<p>Nested HTML body</p>").decode()
+    draft = {
+        "id": "d1",
+        "message": {
+            "id": "m1",
+            "threadId": "t1",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "headers": [{"name": "Subject", "value": "Nested"}],
+                "parts": [
+                    {
+                        "mimeType": "multipart/alternative",
+                        "parts": [
+                            {"mimeType": "text/plain", "body": {"data": plain}},
+                            {"mimeType": "text/html", "body": {"data": html}},
+                        ],
+                    },
+                    {"mimeType": "application/octet-stream", "filename": "file.bin", "body": {}},
+                ],
+            },
+        },
+    }
+    output = ga._draft_output(draft)
+    assert output["body"] == "Nested plain body"
+    assert output["html"] is False
 
 
 def test_delete_exact_draft_and_verify_not_found():
@@ -319,7 +385,12 @@ def test_missing_oauth_credentials_is_structured_nonzero_failure(tmp_path):
 
 def test_expired_oauth_token_refreshes_and_is_saved_profile_locally(tmp_path, monkeypatch):
     token_path = tmp_path / "google_token.json"
-    token_path.write_text(json.dumps({"token": "old", "refresh_token": "refresh", "scopes": ["scope"]}))
+    token_path.write_text(json.dumps({
+        "token": "old",
+        "refresh_token": "refresh",
+        "scopes": ["scope"],
+        "hermes_requested_scopes": ["scope"],
+    }))
 
     class FakeCredentials:
         expired = True
@@ -358,3 +429,4 @@ def test_expired_oauth_token_refreshes_and_is_saved_profile_locally(tmp_path, mo
     saved = json.loads(token_path.read_text())
     assert saved["token"] == "new"
     assert saved["type"] == "authorized_user"
+    assert saved["hermes_requested_scopes"] == ["scope"]

@@ -34,6 +34,8 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from email import encoders, message_from_bytes, policy
+from email.message import EmailMessage
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -151,22 +153,36 @@ def _headers_dict(msg: dict) -> dict[str, str]:
     }
 
 
-def _extract_message_body(msg: dict) -> str:
-    body = ""
+def _decode_body_data(data: str) -> str:
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+
+
+def _find_message_body_part(part: dict, mime_type: str) -> dict | None:
+    if part.get("filename"):
+        return None
+    if part.get("mimeType") == mime_type and part.get("body", {}).get("data"):
+        return part
+    for child in part.get("parts", []):
+        found = _find_message_body_part(child, mime_type)
+        if found is not None:
+            return found
+    return None
+
+
+def _extract_message_body_with_type(msg: dict) -> tuple[str, bool]:
     payload = msg.get("payload", {})
+    for mime_type in ("text/plain", "text/html"):
+        part = _find_message_body_part(payload, mime_type)
+        if part is not None:
+            return _decode_body_data(part["body"]["data"]), mime_type == "text/html"
     if payload.get("body", {}).get("data"):
-        body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
-    elif payload.get("parts"):
-        for part in payload["parts"]:
-            if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-                body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
-                break
-        if not body:
-            for part in payload["parts"]:
-                if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
-                    body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
-                    break
-    return body
+        return _decode_body_data(payload["body"]["data"]), payload.get("mimeType") == "text/html"
+    return "", False
+
+
+def _extract_message_body(msg: dict) -> str:
+    return _extract_message_body_with_type(msg)[0]
 
 
 class VerificationError(RuntimeError):
@@ -192,29 +208,35 @@ def _build_raw_message(*, to: str | None, subject: str, body: str, html: bool) -
 def _draft_output(draft: dict, *, status: str | None = None) -> dict:
     message = draft.get("message", {})
     headers = _headers_dict(message)
+    body, html = _extract_message_body_with_type(message)
     result = {
         "draftId": draft.get("id", ""),
         "messageId": message.get("id", ""),
         "threadId": message.get("threadId", ""),
         "to": headers.get("to", ""),
         "subject": headers.get("subject", ""),
-        "body": _extract_message_body(message),
-        "html": message.get("payload", {}).get("mimeType") == "text/html",
+        "body": body,
+        "html": html,
     }
     if status:
         result = {"status": status, **result}
     return result
 
 
-def _get_draft(backend: str, service, draft_id: str, *, allow_not_found: bool = False):
+def _get_draft(
+    backend: str, service, draft_id: str, *, allow_not_found: bool = False,
+    message_format: str = "full",
+):
     if backend == "gws":
         return _run_gws(
             ["gmail", "users", "drafts", "get"],
-            params={"userId": "me", "id": draft_id, "format": "full"},
+            params={"userId": "me", "id": draft_id, "format": message_format},
             allow_not_found=allow_not_found,
         )
     try:
-        return service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+        return service.users().drafts().get(
+            userId="me", id=draft_id, format=message_format,
+        ).execute()
     except Exception as exc:
         if allow_not_found and _is_not_found(exc):
             return None
@@ -229,6 +251,61 @@ def _verify_draft_fields(actual: dict, expected: dict) -> None:
     }
     if mismatches:
         raise VerificationError(f"Gmail draft read-back mismatch: {json.dumps(mismatches, ensure_ascii=False)}")
+
+
+def _decode_raw_message(raw: str):
+    padded = raw + "=" * (-len(raw) % 4)
+    return message_from_bytes(base64.urlsafe_b64decode(padded), policy=policy.default)
+
+
+def _current_draft_from_raw(draft: dict) -> tuple[dict, EmailMessage]:
+    raw = draft.get("message", {}).get("raw", "")
+    if not raw:
+        raise VerificationError("Gmail did not return the draft's raw MIME message")
+    message = _decode_raw_message(raw)
+    body_part = message.get_body(preferencelist=("plain", "html")) if message.is_multipart() else message
+    body = body_part.get_content() if body_part is not None else ""
+    current = {
+        "to": str(message.get("To", "")),
+        "subject": str(message.get("Subject", "")),
+        "body": body,
+        "html": bool(body_part and body_part.get_content_type() == "text/html"),
+        "threadId": draft.get("message", {}).get("threadId", ""),
+    }
+    return current, message
+
+
+def _replace_header(message, name: str, value: str) -> None:
+    while name in message:
+        del message[name]
+    if value:
+        message[name] = value
+
+
+def _replace_body(message, body: str, *, html: bool) -> None:
+    subtype = "html" if html else "plain"
+    if not message.is_multipart():
+        _set_text_content_exact(message, body, subtype=subtype)
+        return
+    candidates = [
+        part for part in message.walk()
+        if not part.is_multipart()
+        and part.get_content_maintype() == "text"
+        and part.get_content_disposition() != "attachment"
+    ]
+    if not candidates:
+        raise UserInputError("Cannot update the body of a draft with no editable text MIME part")
+    preferred = next((part for part in candidates if part.get_content_subtype() == subtype), candidates[0])
+    _set_text_content_exact(preferred, body, subtype=subtype)
+
+
+def _set_text_content_exact(part, body: str, *, subtype: str) -> None:
+    while "Content-Transfer-Encoding" in part:
+        del part["Content-Transfer-Encoding"]
+    part.set_type(f"text/{subtype}")
+    part.set_param("charset", "utf-8", header="Content-Type", replace=True)
+    part.set_payload(body.encode("utf-8"))
+    encoders.encode_base64(part)
 
 
 def _extract_doc_text(doc: dict) -> str:
@@ -262,15 +339,14 @@ def get_credentials():
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
+    token_payload = json.loads(TOKEN_PATH.read_text())
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        TOKEN_PATH.write_text(
-            json.dumps(
-                _normalize_authorized_user_payload(json.loads(creds.to_json())),
-                indent=2,
-            )
-        )
+        refreshed_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))
+        if token_payload.get("hermes_requested_scopes"):
+            refreshed_payload["hermes_requested_scopes"] = token_payload["hermes_requested_scopes"]
+        TOKEN_PATH.write_text(json.dumps(refreshed_payload, indent=2))
     if not creds.valid:
         print("Token is invalid. Re-run setup.", file=sys.stderr)
         sys.exit(1)
@@ -443,12 +519,19 @@ def gmail_draft_update(args):
         raise UserInputError("Draft update requires at least one changed field")
     backend = "gws" if _gws_binary() else "python"
     service = None if backend == "gws" else build_service("gmail", "v1")
-    current = _draft_output(_get_draft(backend, service, args.draft_id))
+    raw_draft = _get_draft(backend, service, args.draft_id, message_format="raw")
+    current, mime_message = _current_draft_from_raw(raw_draft)
     to = "" if args.clear_to else (args.to if args.to is not None else current["to"])
     subject = args.subject if args.subject is not None else current["subject"]
     body_text = args.body if args.body is not None else current["body"]
     html = True if args.html else current["html"]
-    message = {"raw": _build_raw_message(to=to, subject=subject, body=body_text, html=html)}
+    if args.to is not None or args.clear_to:
+        _replace_header(mime_message, "To", to)
+    if args.subject is not None:
+        _replace_header(mime_message, "Subject", subject)
+    if args.body is not None or args.html:
+        _replace_body(mime_message, body_text, html=html)
+    message = {"raw": base64.urlsafe_b64encode(mime_message.as_bytes()).decode()}
     if current["threadId"]:
         message["threadId"] = current["threadId"]
     request_body = {"message": message}
