@@ -282,21 +282,36 @@ def _replace_header(message, name: str, value: str) -> None:
         message[name] = value
 
 
+def _walk_message_parts(message, parent=None):
+    yield message, parent
+    if message.is_multipart():
+        for child in message.iter_parts():
+            yield from _walk_message_parts(child, message)
+
+
 def _replace_body(message, body: str, *, html: bool) -> None:
     subtype = "html" if html else "plain"
     if not message.is_multipart():
         _set_text_content_exact(message, body, subtype=subtype)
         return
-    candidates = [
-        part for part in message.walk()
+    candidate_pairs = [
+        (part, parent) for part, parent in _walk_message_parts(message)
         if not part.is_multipart()
         and part.get_content_maintype() == "text"
         and part.get_content_disposition() != "attachment"
+        and not part.get_filename()
     ]
-    if not candidates:
+    if not candidate_pairs:
         raise UserInputError("Cannot update the body of a draft with no editable text MIME part")
-    preferred = next((part for part in candidates if part.get_content_subtype() == subtype), candidates[0])
+    preferred, _ = next(
+        ((part, parent) for part, parent in candidate_pairs if part.get_content_subtype() == subtype),
+        candidate_pairs[0],
+    )
     _set_text_content_exact(preferred, body, subtype=subtype)
+    for stale, parent in candidate_pairs:
+        if stale is preferred or parent is None or parent.get_content_subtype() != "alternative":
+            continue
+        parent.set_payload([child for child in parent.get_payload() if child is not stale])
 
 
 def _set_text_content_exact(part, body: str, *, subtype: str) -> None:

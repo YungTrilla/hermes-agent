@@ -231,6 +231,29 @@ def test_update_subject_preserves_cc_custom_headers_and_attachments():
     assert attachments[0].get_payload(decode=True) == b"attachment bytes"
 
 
+def test_replace_body_removes_stale_multipart_alternative_and_keeps_attachment():
+    message = EmailMessage()
+    message.set_content("plain old")
+    message.add_alternative("<p>html old</p>", subtype="html")
+    message.add_attachment(
+        b"attachment bytes", maintype="application", subtype="octet-stream", filename="test.bin"
+    )
+
+    ga._replace_body(message, "plain new", html=False)
+
+    inline_text = [
+        part.get_content()
+        for part in message.walk()
+        if not part.is_multipart()
+        and part.get_content_maintype() == "text"
+        and part.get_content_disposition() != "attachment"
+    ]
+    assert inline_text == ["plain new"]
+    attachments = [part for part in message.walk() if part.get_content_disposition() == "attachment"]
+    assert len(attachments) == 1
+    assert attachments[0].get_payload(decode=True) == b"attachment bytes"
+
+
 def test_update_all_fields_and_explicit_clear_recipient():
     service = FakeService()
     seed(service)
